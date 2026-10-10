@@ -105,6 +105,8 @@ defmodule ReqLLM.StreamServer do
     metadata_delivered?: false,
     terminal_delivered?: false,
     completion_cleanup_after: 30_000,
+    http_task_on_completion: :stop,
+    http_drain_timeout: 5_000,
     completion_cleanup_timer: nil,
     completion_cleanup_token: nil,
     total_timeout: :infinity,
@@ -147,6 +149,9 @@ defmodule ReqLLM.StreamServer do
     * `:fixture_path` - Optional path for fixture capture
     * `:high_watermark` - Positive decoded public-chunk queue bound for backpressure
       (default: 500)
+    * `:http_drain_timeout` - Milliseconds a completed Finch request may keep reading
+      the end of its response, so Finch can return the connection to the pool, before
+      it is stopped (default: `:stream_http_drain_timeout` config, or 5_000)
 
   ## Examples
 
@@ -182,6 +187,12 @@ defmodule ReqLLM.StreamServer do
           opts,
           :completion_cleanup_after,
           Application.get_env(:req_llm, :stream_completion_cleanup_after, 30_000)
+        ),
+      http_drain_timeout:
+        Keyword.get(
+          opts,
+          :http_drain_timeout,
+          Application.get_env(:req_llm, :stream_http_drain_timeout, 5_000)
         ),
       total_timeout: Keyword.get(opts, :total_timeout, :infinity),
       total_timeout_deadline:
@@ -547,6 +558,7 @@ defmodule ReqLLM.StreamServer do
         new_state = %{
           state
           | http_task: task_pid,
+            http_task_on_completion: http_task_on_completion(streamer_mod),
             status: :streaming,
             http_context: http_context,
             canonical_json: canonical_json,
@@ -1702,14 +1714,40 @@ defmodule ReqLLM.StreamServer do
       |> cancel_timeout_budgets()
       |> pop_transport_cancel()
 
-    # Kill HTTP task if running
-    if state.http_task && Process.alive?(state.http_task) do
-      Process.exit(state.http_task, :cancelled)
-    end
+    stop_http_task(state)
 
     ReqLLM.Streaming.InProcessClient.cancel_stream(transport_cancel)
     cancel_completion_cleanup(state)
   end
+
+  # A provider's terminal event (e.g. `data: [DONE]`) arrives before the HTTP
+  # response ends, so a stream can finish while its Finch request is still
+  # reading. Killing the request then closes the connection and the next
+  # request opens a new one. A Finch request whose stream finished normally is
+  # left to read the end of the response so Finch returns the connection to the
+  # pool; the drain is bounded so a response that never ends cannot hold it.
+  defp stop_http_task(%{http_task: task} = state) when is_pid(task) do
+    case http_task_exit(state) do
+      :drain -> {:ok, _timer} = :timer.exit_after(state.http_drain_timeout, task, :cancelled)
+      :stop -> Process.exit(task, :cancelled)
+    end
+
+    :ok
+  end
+
+  defp stop_http_task(_state), do: :ok
+
+  defp http_task_exit(%{http_task_on_completion: :drain, status: :done, metadata: metadata}) do
+    case Map.get(metadata, :finish_reason) do
+      :cancelled -> :stop
+      _finish_reason -> :drain
+    end
+  end
+
+  defp http_task_exit(_state), do: :stop
+
+  defp http_task_on_completion(ReqLLM.Streaming.FinchClient), do: :drain
+  defp http_task_on_completion(_streamer_mod), do: :stop
 
   defp pop_transport_cancel(%{transport_cancel: nil} = state), do: {nil, state}
 

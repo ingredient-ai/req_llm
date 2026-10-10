@@ -1086,7 +1086,9 @@ defmodule ReqLLM do
   Finch pool protocols with `:stream_pool_protocols`, capacity with
   `:stream_pool_size` and `:stream_pool_count`, shard selection with
   `:stream_pool_strategy`, and checkout behavior with `:stream_pool_timeout`
-  config or per-request `pool_timeout: ...`.
+  config or per-request `pool_timeout: ...`. A finished stream lets its HTTP/1
+  request read the end of the response so the connection returns to the pool;
+  `:stream_http_drain_timeout` (default 5_000 ms) bounds that wait.
 
   Use `total_timeout: ...` for a whole-call deadline that includes retries and
   `stream_idle_timeout: ...` to fail a stream that stops making semantic
